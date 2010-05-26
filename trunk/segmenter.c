@@ -137,11 +137,19 @@ int write_index_file(const char index[], const char tmp_index[], const unsigned 
     free(write_buf);
     fclose(index_fp);
 
-    remove(index);
-    if (rename(tmp_index, index)) {
-        fprintf(stderr, "Could not rename %s to %s\n", tmp_index, index);	
-        return -1;
+    // simple filecopy for windows
+    // remove and rename doesnt work well on windows and apache because of file locking
+    FILE *fs,*ft;
+    char ch;
+    fs = fopen(tmp_index,"r");
+    ft = fopen(index,"w");
+
+    while( (ch=getc(fs)) != EOF) {
+            putc(ch,ft);
     }
+
+    fclose(fs);
+    fclose(ft);
 
     return 0;
 }
