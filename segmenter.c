@@ -216,7 +216,7 @@ int main(int argc, char **argv)
     output_prefix = argv[3];
     index = argv[4];
     http_prefix=argv[5];
-    if (argc == 7) {
+    if (argc >= 7) {
         max_tsfiles = strtol(argv[6], &max_tsfiles_check, 10);
         if (max_tsfiles_check == argv[6] || max_tsfiles < 0 || max_tsfiles >= INT_MAX) {
             fprintf(stderr, "Maximum number of ts files (%s) invalid\n", argv[6]);
@@ -225,7 +225,7 @@ int main(int argc, char **argv)
     }
 
     // end programm when it found a file with name 'kill'
-    if (argc == 8) kill_file = atoi(argv[7]);
+    if (argc >= 8) kill_file = atoi(argv[7]);
 
     remove_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
     if (!remove_filename) {
