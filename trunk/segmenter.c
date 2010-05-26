@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "libavformat/avformat.h"
 
@@ -169,10 +171,19 @@ int main(int argc, char **argv)
     int ret;
     int i;
     int remove_file;
+    FILE * pid_file;
 
     if (argc < 6 || argc > 7) {
         fprintf(stderr, "Usage: %s <input MPEG-TS file> <segment duration in seconds> <output MPEG-TS file prefix> <output m3u8 index file> <http prefix> [<segment window size>]\n", argv[0]);
         exit(1);
+    }
+
+    // Create PID file
+    pid_file=fopen("./segmenter.pid", "w");
+    if (pid_file)
+    {
+    	fprintf(pid_file, "%d", getpid());
+        fclose(pid_file);
     }
 
     av_register_all();
@@ -184,7 +195,7 @@ int main(int argc, char **argv)
     segment_duration = strtod(argv[2], &segment_duration_check);
     if (segment_duration_check == argv[2] || segment_duration == HUGE_VAL || segment_duration == -HUGE_VAL) {
         fprintf(stderr, "Segment duration time (%s) invalid\n", argv[2]);
-        exit(1);
+        goto error;
     }
     output_prefix = argv[3];
     index = argv[4];
@@ -193,26 +204,26 @@ int main(int argc, char **argv)
         max_tsfiles = strtol(argv[6], &max_tsfiles_check, 10);
         if (max_tsfiles_check == argv[6] || max_tsfiles < 0 || max_tsfiles >= INT_MAX) {
             fprintf(stderr, "Maximum number of ts files (%s) invalid\n", argv[6]);
-            exit(1);
+            goto error;
         }
     }
 
     remove_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
     if (!remove_filename) {
         fprintf(stderr, "Could not allocate space for remove filenames\n");
-        exit(1);
+        goto error;
     }
 
     output_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
     if (!output_filename) {
         fprintf(stderr, "Could not allocate space for output filenames\n");
-        exit(1);
+        goto error;
     }
 
     tmp_index = malloc(strlen(index) + 2);
     if (!tmp_index) {
         fprintf(stderr, "Could not allocate space for temporary index filename\n");
-        exit(1);
+        goto error;
     }
 
     strncpy(tmp_index, index, strlen(index) + 2);
@@ -226,30 +237,30 @@ int main(int argc, char **argv)
     ifmt = av_find_input_format("mpegts");
     if (!ifmt) {
         fprintf(stderr, "Could not find MPEG-TS demuxer\n");
-        exit(1);
+        goto error;
     }
 
     ret = av_open_input_file(&ic, input, ifmt, 0, NULL);
     if (ret != 0) {
         fprintf(stderr, "Could not open input file, make sure it is an mpegts file: %d\n", ret);
-        exit(1);
+        goto error;
     }
 
     if (av_find_stream_info(ic) < 0) {
         fprintf(stderr, "Could not read stream information\n");
-        exit(1);
+        goto error;
     }
 
     ofmt = guess_format("mpegts", NULL, NULL);
     if (!ofmt) {
         fprintf(stderr, "Could not find MPEG-TS muxer\n");
-        exit(1);
+        goto error;
     }
 
     oc = avformat_alloc_context();
     if (!oc) {
         fprintf(stderr, "Could not allocated output context");
-        exit(1);
+        goto error;
     }
     oc->oformat = ofmt;
 
@@ -276,7 +287,7 @@ int main(int argc, char **argv)
 
     if (av_set_parameters(oc, NULL) < 0) {
         fprintf(stderr, "Invalid output format parameters\n");
-        exit(1);
+        goto error;
     }
 
     dump_format(oc, 0, output_prefix, 1);
@@ -293,12 +304,12 @@ int main(int argc, char **argv)
     snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, output_index++);
     if (url_fopen(&oc->pb, output_filename, URL_WRONLY) < 0) {
         fprintf(stderr, "Could not open '%s'\n", output_filename);
-        exit(1);
+        goto error;
     }
 
     if (av_write_header(oc)) {
         fprintf(stderr, "Could not write mpegts header to first output file\n");
-        exit(1);
+        goto error;
     }
 
     write_index = !write_index_file(index, tmp_index, segment_duration, output_prefix, http_prefix, first_segment, last_segment, 0, max_tsfiles);
@@ -400,7 +411,15 @@ int main(int argc, char **argv)
         remove(remove_filename);
     }
 
+    remove("./segmenter.pid");
+
     return 0;
+
+error:
+    remove("./segmenter.pid");
+
+    return 1;
+
 }
 
 // vim:sw=4:tw=4:ts=4:ai:expandtab
