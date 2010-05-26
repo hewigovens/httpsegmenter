@@ -1,4 +1,5 @@
 /* $Id$
+ * $HeadURL
  *
  * Copyright (c) 2009 Chase Douglas
  *
@@ -136,7 +137,13 @@ int write_index_file(const char index[], const char tmp_index[], const unsigned 
     free(write_buf);
     fclose(index_fp);
 
-    return rename(tmp_index, index);
+    remove(index);
+    if (rename(tmp_index, index)) {
+        fprintf(stderr, "Could not rename %s to %s\n", tmp_index, index);	
+        return -1;
+    }
+
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -163,6 +170,7 @@ int main(int argc, char **argv)
     char *remove_filename;
     int video_index;
     int audio_index;
+    int kill_file = 0;
     unsigned int first_segment = 1;
     unsigned int last_segment = 0;
     int write_index = 1;
@@ -173,8 +181,8 @@ int main(int argc, char **argv)
     int remove_file;
     FILE * pid_file;
 
-    if (argc < 6 || argc > 7) {
-        fprintf(stderr, "Usage: %s <input MPEG-TS file> <segment duration in seconds> <output MPEG-TS file prefix> <output m3u8 index file> <http prefix> [<segment window size>]\n", argv[0]);
+    if (argc < 6 || argc > 8) {
+        fprintf(stderr, "Usage: %s <input MPEG-TS file> <segment duration in seconds> <output MPEG-TS file prefix> <output m3u8 index file> <http prefix> [<segment window size>] [<search kill file>]\n\nCompiled by Daniel Espendiller - www.espend.de\nbuild on %s %s with %s\n\nTook some code from:\n - source:http://svn.assembla.com/svn/legend/segmenter/\n - iStreamdev:http://projects.vdr-developer.org/git/?p=istreamdev.git;a=tree;f=segmenter;hb=HEAD\n - live_segmenter:http://github.com/carsonmcdonald/HTTP-Live-Video-Stream-Segmenter-and-Distributor", argv[0], __DATE__, __TIME__, __VERSION__);
         exit(1);
     }
 
@@ -207,6 +215,9 @@ int main(int argc, char **argv)
             goto error;
         }
     }
+
+    // end programm when it found a file with name 'kill'
+    if (argc == 8) kill_file = atoi(argv[7]);
 
     remove_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
     if (!remove_filename) {
@@ -251,7 +262,11 @@ int main(int argc, char **argv)
         goto error;
     }
 
-    ofmt = guess_format("mpegts", NULL, NULL);
+    #if LIBAVFORMAT_VERSION_MAJOR >= 52 && LIBAVFORMAT_VERSION_MINOR >= 45
+        ofmt = av_guess_format("mpegts", NULL, NULL);
+    #else
+        ofmt = guess_format("mpegts", NULL, NULL);
+    #endif
     if (!ofmt) {
         fprintf(stderr, "Could not find MPEG-TS muxer\n");
         goto error;
@@ -366,6 +381,16 @@ int main(int argc, char **argv)
                 break;
             }
 
+            // close when when we find the file 'kill'
+            if (kill_file) {
+                FILE* fp = fopen("kill","r");
+                if (fp) {
+                    fprintf(stderr, "user abort: found kill file\n");		  
+                    fclose(fp);
+                    remove("kill");
+                    decode_done = 1;
+                }
+            }
             prev_segment_time = segment_time;
         }
 
