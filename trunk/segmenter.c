@@ -129,25 +129,26 @@ FILE * write_index_file(FILE * tmp_index_fp,
     return tmp_index_fp;
 }
 
-void close_index_file(FILE * tmp_index_fp,
-                      const char index[],
-                      const unsigned int target_segment_duration,
-                      const unsigned int first_segment,
-                      const int window)
+FILE * close_index_file(FILE * tmp_index_fp,
+                        const char index[],
+                        const unsigned int target_segment_duration,
+                        const unsigned int first_segment,
+                        const int window)
 {
     char write_buf[1024] = { 0 };
     FILE * index_fp = NULL;
     
     if (!tmp_index_fp)
     {
-        return;
+        return NULL;
     }
     
     index_fp = fopen(index, "wb");
     if (!index_fp)
     {
         fprintf(stderr, "Could not open m3u8 index file (%s), no index file will be created\n", index);
-        return;
+	fclose(tmp_index_fp);
+	return NULL;
     };
 
     if (window)
@@ -170,7 +171,8 @@ void close_index_file(FILE * tmp_index_fp,
     {
         fprintf(stderr, "Could not write to m3u8 index file, will not continue writing to index file\n");
         fclose(index_fp);
-        return;
+	fclose(tmp_index_fp);
+        return NULL;
     }
 
     /* rewind the temp index file and transfer it's contents into the index file */
@@ -182,6 +184,9 @@ void close_index_file(FILE * tmp_index_fp,
         {
             fwrite(&ch, 1, 1, index_fp);
         }
+
+	fclose(tmp_index_fp);
+	tmp_index_fp = NULL;
     }
     
     snprintf(write_buf, sizeof(write_buf), "#EXT-X-ENDLIST\n");
@@ -191,6 +196,7 @@ void close_index_file(FILE * tmp_index_fp,
     }
 
     fclose(index_fp);
+    return tmp_index_fp;
 }
 
 typedef struct SMPacketLink
@@ -734,9 +740,7 @@ int main(int argc, char **argv)
         remove_file = 0;
     }
 
-    tmp_index_fp = write_index_file(tmp_index_fp, segment_duration, output_prefix, http_prefix, ++last_segment);
-    close_index_file(tmp_index_fp, index, target_segment_duration, first_segment, max_tsfiles);
-    tmp_index_fp = NULL;
+    tmp_index_fp = write_index_file(tmp_index_fp, segment_duration, output_prefix, http_prefix, ++last_segment);    tmp_index_fp = close_index_file(tmp_index_fp, index, target_segment_duration, first_segment, max_tsfiles);
     
     remove(tmp_index);
     
