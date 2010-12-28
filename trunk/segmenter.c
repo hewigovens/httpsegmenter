@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <assert.h>
 
 #include "libavformat/avformat.h"
 
@@ -154,6 +155,140 @@ int write_index_file(const char index[], const char tmp_index[], const unsigned 
     return 0;
 }
 
+typedef struct SMPacketLink
+{
+    /* packet start time in seconds */
+    double timeStamp;
+
+    /* the packet */
+    AVPacket packet;
+
+    /* a boolean flag indicating whether this is an audio packet */
+    int isAudio;
+
+    /* a link to the next packet */
+    struct SMPacketLink * next;
+    
+} TSMPacketLink;
+
+typedef struct SMPacketList
+{
+    TSMPacketLink * head;
+    TSMPacketLink * tail;
+    unsigned int size;
+} TSMPacketList;
+
+static TSMPacketLink *
+createLink(const AVPacket * packet, double timeStamp, int isAudio)
+{
+    TSMPacketLink * link = (TSMPacketLink *) malloc(sizeof(TSMPacketLink));
+    link->isAudio = isAudio;
+    link->timeStamp = timeStamp;
+    link->next = NULL;
+    memcpy(&link->packet, packet, sizeof(AVPacket));
+    return link;
+}
+
+static int
+firstPrecedesSecond(const TSMPacketLink * first,
+                    const TSMPacketLink * second)
+{
+    if (first->timeStamp < second->timeStamp ||
+        first->timeStamp == second->timeStamp && first->isAudio)
+    {
+        /* audio packet with the same timestamp as a video packet
+           should precede the video packet */
+        return 1;
+    }
+    
+    return 0;
+}
+
+static void
+insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp, int isAudio)
+{
+    TSMPacketLink * link = createLink(packet, timeStamp, isAudio);
+    if (!packets->head)
+    {
+        assert(!packets->tail);
+        assert(!packets->size);
+        packets->head = link;
+        packets->tail = link;
+        packets->size = 1;
+    }
+    else if (firstPrecedesSecond(packets->tail, link))
+    {
+        /* attach at the tail */
+        assert(packets->size > 0);
+        
+        packets->tail->next = link;
+        packets->tail = link;
+        packets->size++;
+    }
+    else
+    {
+        /* insert link into the list sorted in ascending time stamp order */
+        TSMPacketLink * prev = NULL;
+        
+        assert(packets->size > 0);
+        for (TSMPacketLink * i = packets->head; i != NULL; i = i->next)
+        {
+            if (firstPrecedesSecond(i, link))
+            {
+                prev = i;
+                continue;
+            }
+            
+            if (i == packets->head)
+            {
+                packets->head = link;
+            }
+            else
+            {
+                prev->next = link;
+            }
+            
+            link->next = i;
+            packets->size++;
+            return;
+        }
+        
+        /* sanity check, this should never happen */
+        assert(0);
+    }
+}
+
+static int
+removePacket(TSMPacketList * packets, AVPacket * packet)
+{
+    TSMPacketLink * link = packets->head;
+    if (!link)
+    {
+        return 0;
+    }
+    
+    /* the list is sorted, always remove from the head */
+    memcpy(packet, &link->packet, sizeof(AVPacket));
+    packets->head = link->next;
+    packets->size--;
+    
+    if (!packets->head)
+    {
+        packets->tail = NULL;
+    }
+    
+    free(link);
+    return 1;
+}
+
+static TSMPacketList *
+createPacketList()
+{
+    TSMPacketList * packets = (TSMPacketList *)malloc(sizeof(TSMPacketList));
+    memset(packets, 0, sizeof(TSMPacketList));
+    return packets;
+}
+
 int main(int argc, char **argv)
 {
     const char *input;
@@ -182,13 +317,16 @@ int main(int argc, char **argv)
     unsigned int first_segment = 1;
     unsigned int last_segment = 0;
     int write_index = 1;
-    int decode_done;
+    int decode_done = 0;
     char *dot;
     int ret;
     int i;
     int remove_file;
     FILE * pid_file;
-
+    double packetStartTime = 0.0;
+    double packetDuration = 0.0;
+    TSMPacketList * packetQueue = createPacketList();
+    
     if (argc < 6 || argc > 8) {
         fprintf(stderr, "Usage: %s <input MPEG-TS file> <segment duration in seconds> <output MPEG-TS file prefix> <output m3u8 index file> <http prefix> [<segment window size>] [<search kill file>]\n\nCompiled by Daniel Espendiller - www.espend.de\nbuild on %s %s with %s\n\nTook some code from:\n - source:http://svn.assembla.com/svn/legend/segmenter/\n - iStreamdev:http://projects.vdr-developer.org/git/?p=istreamdev.git;a=tree;f=segmenter;hb=HEAD\n - live_segmenter:http://github.com/carsonmcdonald/HTTP-Live-Video-Stream-Segmenter-and-Distributor", argv[0], __DATE__, __TIME__, __VERSION__);
         exit(1);
@@ -343,22 +481,71 @@ int main(int argc, char **argv)
         double segment_time;
         AVPacket packet;
 
-        decode_done = av_read_frame(ic, &packet);
-        if (decode_done < 0) {
-            break;
+        if (!decode_done)
+        {
+            decode_done = av_read_frame(ic, &packet);
+            if (!decode_done)
+            {
+                double timeStamp = 
+                    (double)(packet.pts) * 
+                    (double)(ic->streams[packet.stream_index]->time_base.num) /
+                    (double)(ic->streams[packet.stream_index]->time_base.den);
+                 
+                if (av_dup_packet(&packet) < 0)
+                {
+                    fprintf(stderr, "Could not duplicate packet");
+                    av_free_packet(&packet);
+                    break;
+                }
+                
+                insertPacket(packetQueue,
+                             &packet,
+                             timeStamp,
+                             packet.stream_index == audio_index);
+            }
         }
-
-        if (av_dup_packet(&packet) < 0) {
-            fprintf(stderr, "Could not duplicate packet");
-            av_free_packet(&packet);
-            break;
+        
+        if (packetQueue->size < 50 && !decode_done)
+        {
+            /* allow the queue to fill up so that the packets can be sorted properly */
+            continue;
         }
+        
+        if (!removePacket(packetQueue, &packet))
+        {
+            if (decode_done)
+            {
+                /* the queue is empty, we are done */
+                break;
+            }
+            
+            assert(decode_done);
+            continue;
+        }
+        
+        packetStartTime = 
+            (double)(packet.pts) * 
+            (double)(ic->streams[packet.stream_index]->time_base.num) /
+            (double)(ic->streams[packet.stream_index]->time_base.den);
+        
+#if !defined(NDEBUG) && (defined(DEBUG) || defined(_DEBUG))
+        packetDuration =
+            (double)(packet.duration) *
+            (double)(ic->streams[packet.stream_index]->time_base.num) /
+            (double)(ic->streams[packet.stream_index]->time_base.den);
+        
+        fprintf(stderr,
+                "stream %i, packet [%f, %f)\n",
+                packet.stream_index,
+                packetStartTime,
+                packetStartTime + packetDuration);
+#endif
 
         if (packet.stream_index == video_index && (packet.flags & PKT_FLAG_KEY)) {
-            segment_time = (double)video_st->pts.val * video_st->time_base.num / video_st->time_base.den;
+            segment_time = packetStartTime;
         }
         else if (video_index < 0) {
-            segment_time = (double)audio_st->pts.val * audio_st->time_base.num / audio_st->time_base.den;
+            segment_time = packetStartTime;
         }
         else {
             segment_time = prev_segment_time;
@@ -399,6 +586,7 @@ int main(int argc, char **argv)
                     fclose(fp);
                     remove("kill");
                     decode_done = 1;
+                    packetQueue->size = 0;
                 }
             }
             prev_segment_time = segment_time;
@@ -415,7 +603,7 @@ int main(int argc, char **argv)
         }
 
         av_free_packet(&packet);
-    } while (!decode_done);
+    } while (!decode_done || packetQueue->size);
 
     av_write_trailer(oc);
 
