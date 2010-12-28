@@ -199,9 +199,6 @@ typedef struct SMPacketLink
     /* the packet */
     AVPacket packet;
 
-    /* a boolean flag indicating whether this is an audio packet */
-    int isAudio;
-
     /* a link to the next packet */
     struct SMPacketLink * next;
     
@@ -215,10 +212,9 @@ typedef struct SMPacketList
 } TSMPacketList;
 
 static TSMPacketLink *
-createLink(const AVPacket * packet, double timeStamp, int isAudio)
+createLink(const AVPacket * packet, double timeStamp)
 {
     TSMPacketLink * link = (TSMPacketLink *) malloc(sizeof(TSMPacketLink));
-    link->isAudio = isAudio;
     link->timeStamp = timeStamp;
     link->next = NULL;
     memcpy(&link->packet, packet, sizeof(AVPacket));
@@ -226,14 +222,19 @@ createLink(const AVPacket * packet, double timeStamp, int isAudio)
 }
 
 static int
-firstPrecedesSecond(const TSMPacketLink * first,
+packetsCorrectlySorted(const TSMPacketLink * first,
                     const TSMPacketLink * second)
 {
-    if (first->timeStamp < second->timeStamp ||
-        first->timeStamp == second->timeStamp && first->isAudio)
+    if (first->packet.stream_index == second->packet.stream_index)
     {
-        /* audio packet with the same timestamp as a video packet
-           should precede the video packet */
+        /* assume that the packets in each stream are already correctly sorted */
+        return 1;
+    }
+    
+    if (first->timeStamp < second->timeStamp)
+    {
+        /* improve lacing so that that audio/video packets that should be
+           together do not get stuck into separate segments. */
         return 1;
     }
     
@@ -241,9 +242,9 @@ firstPrecedesSecond(const TSMPacketLink * first,
 }
 
 static void
-insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp, int isAudio)
+insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp)
 {
-    TSMPacketLink * link = createLink(packet, timeStamp, isAudio);
+    TSMPacketLink * link = createLink(packet, timeStamp);
     if (!packets->head)
     {
         assert(!packets->tail);
@@ -251,15 +252,6 @@ insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp,
         packets->head = link;
         packets->tail = link;
         packets->size = 1;
-    }
-    else if (firstPrecedesSecond(packets->tail, link))
-    {
-        /* attach at the tail */
-        assert(packets->size > 0);
-        
-        packets->tail->next = link;
-        packets->tail = link;
-        packets->size++;
     }
     else
     {
@@ -269,7 +261,7 @@ insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp,
         assert(packets->size > 0);
         for (TSMPacketLink * i = packets->head; i != NULL; i = i->next)
         {
-            if (firstPrecedesSecond(i, link))
+            if (packetsCorrectlySorted(i, link))
             {
                 prev = i;
                 continue;
@@ -289,8 +281,12 @@ insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp,
             return;
         }
         
-        /* sanity check, this should never happen */
-        assert(0);
+        /* attach at the tail */
+        assert(packets->size > 0);
+        
+        packets->tail->next = link;
+        packets->tail = link;
+        packets->size++;
     }
 }
 
@@ -343,8 +339,8 @@ int main(int argc, char **argv)
     AVOutputFormat *ofmt;
     AVFormatContext *ic = NULL;
     AVFormatContext *oc;
-    AVStream *video_st;
-    AVStream *audio_st;
+    AVStream *video_st = NULL;
+    AVStream *audio_st = NULL;
     AVCodec *codec;
     char *output_filename;
     char *remove_filename;
@@ -537,10 +533,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 
-                insertPacket(packetQueue,
-                             &packet,
-                             timeStamp,
-                             packet.stream_index == audio_index);
+                insertPacket(packetQueue, &packet, timeStamp);
             }
         }
         
