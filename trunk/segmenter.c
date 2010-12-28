@@ -22,6 +22,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <assert.h>
+#include <float.h>
+#include <math.h>
 
 #include "libavformat/avformat.h"
 
@@ -211,6 +213,12 @@ typedef struct SMPacketList
     unsigned int size;
 } TSMPacketList;
 
+typedef struct SMStreamLace
+{
+    TSMPacketList ** streams;
+    unsigned int numStreams;
+} TSMStreamLace;
+
 static TSMPacketLink *
 createLink(const AVPacket * packet, double timeStamp)
 {
@@ -221,28 +229,8 @@ createLink(const AVPacket * packet, double timeStamp)
     return link;
 }
 
-static int
-packetsCorrectlySorted(const TSMPacketLink * first,
-                    const TSMPacketLink * second)
-{
-    if (first->packet.stream_index == second->packet.stream_index)
-    {
-        /* assume that the packets in each stream are already correctly sorted */
-        return 1;
-    }
-    
-    if (first->timeStamp < second->timeStamp)
-    {
-        /* improve lacing so that that audio/video packets that should be
-           together do not get stuck into separate segments. */
-        return 1;
-    }
-    
-    return 0;
-}
-
 static void
-insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp)
+fifoPush(TSMPacketList * packets, const AVPacket * packet, double timeStamp)
 {
     TSMPacketLink * link = createLink(packet, timeStamp);
     if (!packets->head)
@@ -255,32 +243,6 @@ insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp)
     }
     else
     {
-        /* insert link into the list sorted in ascending time stamp order */
-        TSMPacketLink * prev = NULL;
-        
-        assert(packets->size > 0);
-        for (TSMPacketLink * i = packets->head; i != NULL; i = i->next)
-        {
-            if (packetsCorrectlySorted(i, link))
-            {
-                prev = i;
-                continue;
-            }
-            
-            if (i == packets->head)
-            {
-                packets->head = link;
-            }
-            else
-            {
-                prev->next = link;
-            }
-            
-            link->next = i;
-            packets->size++;
-            return;
-        }
-        
         /* attach at the tail */
         assert(packets->size > 0);
         
@@ -291,7 +253,7 @@ insertPacket(TSMPacketList * packets, const AVPacket * packet, double timeStamp)
 }
 
 static int
-removePacket(TSMPacketList * packets, AVPacket * packet)
+fifoPop(TSMPacketList * packets, AVPacket * packet)
 {
     TSMPacketLink * link = packets->head;
     if (!link)
@@ -299,7 +261,6 @@ removePacket(TSMPacketList * packets, AVPacket * packet)
         return 0;
     }
     
-    /* the list is sorted, always remove from the head */
     memcpy(packet, &link->packet, sizeof(AVPacket));
     packets->head = link->next;
     packets->size--;
@@ -319,6 +280,95 @@ createPacketList()
     TSMPacketList * packets = (TSMPacketList *)malloc(sizeof(TSMPacketList));
     memset(packets, 0, sizeof(TSMPacketList));
     return packets;
+}
+
+static TSMStreamLace *
+createStreamLace(unsigned int numStreams)
+{
+    TSMStreamLace * lace = (TSMStreamLace *)malloc(sizeof(TSMStreamLace));
+    lace->streams = (TSMPacketList **)malloc(sizeof(TSMPacketList *) * numStreams);
+    
+    for (unsigned int i = 0; i < numStreams; i++)
+    {
+        lace->streams[i] = createPacketList();
+    }
+
+    lace->numStreams = numStreams;
+    return lace;
+}
+
+static void
+insertPacket(TSMStreamLace * lace, const AVPacket * packet, double timeStamp)
+{
+    fifoPush(lace->streams[packet->stream_index], packet, timeStamp);
+}
+
+static TSMPacketList *
+chooseNextStream(TSMStreamLace * lace)
+{
+    /* improve lacing so that that audio/video packets that should be
+       together do not get stuck into separate segments. */
+    
+    TSMPacketList * nextStream = NULL;
+    double earliestTimeStamp = DBL_MAX;
+    for (unsigned int i = 0; i < lace->numStreams; i++)
+    {
+        TSMPacketList * stream = lace->streams[i];
+        if (stream->size && stream->head->timeStamp < earliestTimeStamp)
+        {
+            nextStream = stream;
+            earliestTimeStamp = stream->head->timeStamp;
+        }
+    }
+    
+    return nextStream;
+}
+
+static int
+removePacket(TSMStreamLace * lace, AVPacket * packet)
+{
+    TSMPacketList * stream = chooseNextStream(lace);
+    if (!stream)
+    {
+        return 0;
+    }
+    
+    return fifoPop(stream, packet);
+}
+
+static unsigned int
+countPackets(const TSMStreamLace * lace)
+{
+    unsigned int numPackets = 0;
+    for (unsigned int i = 0; i < lace->numStreams; i++)
+    {
+        const TSMPacketList * stream = lace->streams[i];
+        numPackets += stream->size;
+    }
+
+    return numPackets;
+}
+
+static void
+removeAllPackets(TSMStreamLace * lace)
+{
+    AVPacket packet;
+    for (unsigned int i = 0; i < lace->numStreams; i++)
+    {
+        TSMPacketList * stream = lace->streams[i];
+        while (stream->size)
+        {
+            fifoPop(stream, &packet);
+            av_free_packet(&packet);
+        }
+    }
+}
+
+static int
+closeEnough(double value, double targetValue, double tolerance)
+{
+    double error = fabs(targetValue - value);
+    return (error <= tolerance) ? 1 : 0;
 }
 
 int main(int argc, char **argv)
@@ -355,11 +405,28 @@ int main(int argc, char **argv)
     int i;
     int remove_file;
     FILE * pid_file;
-    TSMPacketList * packetQueue = createPacketList();
+    TSMStreamLace * streamLace = NULL;
     FILE * tmp_index_fp = NULL;
     
     if (argc < 6 || argc > 8) {
-        fprintf(stderr, "Usage: %s <input MPEG-TS file> <segment duration in seconds> <output MPEG-TS file prefix> <output m3u8 index file> <http prefix> [<segment window size>] [<search kill file>]\n\nCompiled by Daniel Espendiller - www.espend.de\nbuild on %s %s with %s\n\nTook some code from:\n - source:http://svn.assembla.com/svn/legend/segmenter/\n - iStreamdev:http://projects.vdr-developer.org/git/?p=istreamdev.git;a=tree;f=segmenter;hb=HEAD\n - live_segmenter:http://github.com/carsonmcdonald/HTTP-Live-Video-Stream-Segmenter-and-Distributor", argv[0], __DATE__, __TIME__, __VERSION__);
+        fprintf(stderr,
+                "Usage: %s <input MPEG-TS file> "
+                "<segment duration in seconds> "
+                "<output MPEG-TS file prefix> "
+                "<output m3u8 index file> "
+                "<http prefix> "
+                "[<segment window size>] "
+                "[<search kill file>]\n\n"
+                "Compiled by Daniel Espendiller - www.espend.de\n"
+                "build on %s %s with %s\n\n"
+                "Took some code from:\n"
+                " - source:http://svn.assembla.com/svn/legend/segmenter/\n"
+                " - iStreamdev:http://projects.vdr-developer.org/git/?p=istreamdev.git;a=tree;f=segmenter;hb=HEAD\n"
+                " - live_segmenter:http://github.com/carsonmcdonald/HTTP-Live-Video-Stream-Segmenter-and-Distributor\n",
+                argv[0],
+                __DATE__,
+                __TIME__,
+                __VERSION__);
         exit(1);
     }
 
@@ -367,7 +434,7 @@ int main(int argc, char **argv)
     pid_file=fopen("./segmenter.pid", "wb");
     if (pid_file)
     {
-    	fprintf(pid_file, "%d", getpid());
+        fprintf(pid_file, "%d", getpid());
         fclose(pid_file);
     }
 
@@ -439,11 +506,13 @@ int main(int argc, char **argv)
         goto error;
     }
 
-    #if LIBAVFORMAT_VERSION_MAJOR >= 52 && LIBAVFORMAT_VERSION_MINOR >= 45
-        ofmt = av_guess_format("mpegts", NULL, NULL);
-    #else
-        ofmt = guess_format("mpegts", NULL, NULL);
-    #endif
+#if LIBAVFORMAT_VERSION_MAJOR > 52 || (LIBAVFORMAT_VERSION_MAJOR == 52 && \
+                                       LIBAVFORMAT_VERSION_MINOR >= 45)
+    ofmt = av_guess_format("mpegts", NULL, NULL);
+#else
+    ofmt = guess_format("mpegts", NULL, NULL);
+#endif
+    
     if (!ofmt) {
         fprintf(stderr, "Could not find MPEG-TS muxer\n");
         goto error;
@@ -451,7 +520,7 @@ int main(int argc, char **argv)
 
     oc = avformat_alloc_context();
     if (!oc) {
-        fprintf(stderr, "Could not allocated output context");
+        fprintf(stderr, "Could not allocated output context\n");
         goto error;
     }
     oc->oformat = ofmt;
@@ -483,7 +552,7 @@ int main(int argc, char **argv)
     }
 
     dump_format(oc, 0, output_prefix, 1);
-
+    
     if (video_index >=0) {
       codec = avcodec_find_decoder(video_st->codec->codec_id);
       if (!codec) {
@@ -510,6 +579,8 @@ int main(int argc, char **argv)
 
     tmp_index_fp = start_index_file(tmp_index);
 
+    streamLace = createStreamLace(ic->nb_streams);
+    
     do {
         double segment_time = 0.0;
         AVPacket packet;
@@ -528,22 +599,22 @@ int main(int argc, char **argv)
                  
                 if (av_dup_packet(&packet) < 0)
                 {
-                    fprintf(stderr, "Could not duplicate packet");
+                    fprintf(stderr, "Could not duplicate packet\n");
                     av_free_packet(&packet);
                     break;
                 }
                 
-                insertPacket(packetQueue, &packet, timeStamp);
+                insertPacket(streamLace, &packet, timeStamp);
             }
         }
         
-        if (packetQueue->size < 50 && !decode_done)
+        if (countPackets(streamLace) < 50 && !decode_done)
         {
             /* allow the queue to fill up so that the packets can be sorted properly */
             continue;
         }
         
-        if (!removePacket(packetQueue, &packet))
+        if (!removePacket(streamLace, &packet))
         {
             if (decode_done)
             {
@@ -585,7 +656,7 @@ int main(int argc, char **argv)
             segment_time = prev_segment_time;
         }
 
-        if (segment_time - prev_segment_time >= target_segment_duration) {
+        if (closeEnough(segment_time - prev_segment_time, target_segment_duration, 0.5)) {
             put_flush_packet(oc->pb);
             url_fclose(oc->pb);
 
@@ -614,15 +685,15 @@ int main(int argc, char **argv)
                 break;
             }
 
-            // close when when we find the file 'kill'
+            // close when we find the 'kill' file
             if (kill_file) {
                 FILE* fp = fopen("kill", "rb");
                 if (fp) {
-                    fprintf(stderr, "user abort: found kill file\n");		  
+                    fprintf(stderr, "user abort: found kill file\n");
                     fclose(fp);
                     remove("kill");
                     decode_done = 1;
-                    packetQueue->size = 0;
+                    removeAllPackets(streamLace);
                 }
             }
             prev_segment_time = segment_time;
@@ -639,7 +710,7 @@ int main(int argc, char **argv)
         }
 
         av_free_packet(&packet);
-    } while (!decode_done || packetQueue->size);
+    } while (!decode_done || countPackets(streamLace) > 0);
 
     av_write_trailer(oc);
 
@@ -666,6 +737,8 @@ int main(int argc, char **argv)
     tmp_index_fp = write_index_file(tmp_index_fp, segment_duration, output_prefix, http_prefix, ++last_segment);
     close_index_file(tmp_index_fp, index, target_segment_duration, first_segment, max_tsfiles);
     tmp_index_fp = NULL;
+    
+    remove(tmp_index);
     
     if (remove_file) {
         snprintf(remove_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, first_segment - 1);
