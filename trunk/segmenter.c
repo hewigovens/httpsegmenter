@@ -1,5 +1,5 @@
 /* $Id$
- * $HeadURL$
+ * $HeadURL
  *
  * Copyright (c) 2009 Chase Douglas
  *
@@ -391,7 +391,6 @@ int main(int argc, char **argv)
     double prev_segment_time = 0.0;
     double segment_duration = 0.0;
     unsigned int output_index = 1;
-    AVInputFormat *ifmt;
     AVOutputFormat *ofmt;
     AVFormatContext *ic = NULL;
     AVFormatContext *oc;
@@ -413,6 +412,7 @@ int main(int argc, char **argv)
     FILE * pid_file;
     TSMStreamLace * streamLace = NULL;
     FILE * tmp_index_fp = NULL;
+    AVBitStreamFilterContext * vbsf_h264_mp4toannexb = NULL;
     
     if (argc < 6 || argc > 8) {
         fprintf(stderr,
@@ -495,21 +495,21 @@ int main(int argc, char **argv)
     }
     *dot = '.';
 
-    ifmt = av_find_input_format("mpegts");
-    if (!ifmt) {
-        fprintf(stderr, "Could not find MPEG-TS demuxer\n");
-        goto error;
-    }
-
-    ret = av_open_input_file(&ic, input, ifmt, 0, NULL);
+    ret = av_open_input_file(&ic, input, NULL, 0, NULL);
     if (ret != 0) {
-        fprintf(stderr, "Could not open input file, make sure it is an mpegts file: %d\n", ret);
+        fprintf(stderr, "Could not open input file, make sure it is an mpegts or mp4 file: %d\n", ret);
         goto error;
     }
 
     if (av_find_stream_info(ic) < 0) {
         fprintf(stderr, "Could not read stream information\n");
         goto error;
+    }
+
+    if (strstr(ic->iformat->name, "mp4") != NULL)
+    {
+        // need to filter the bitstream when re-formatting mp4 to mpeg-ts:
+        vbsf_h264_mp4toannexb = av_bitstream_filter_init("h264_mp4toannexb");
     }
 
 #if LIBAVFORMAT_VERSION_MAJOR > 52 || (LIBAVFORMAT_VERSION_MAJOR == 52 && \
@@ -598,11 +598,18 @@ int main(int argc, char **argv)
             decode_done = av_read_frame(ic, &packet);
             if (!decode_done)
             {
+                if (packet.stream_index != video_index &&
+                    packet.stream_index != audio_index)
+                {
+                    av_free_packet(&packet);
+                    continue;
+                }
+                
                 double timeStamp = 
                     (double)(packet.pts) * 
                     (double)(ic->streams[packet.stream_index]->time_base.num) /
                     (double)(ic->streams[packet.stream_index]->time_base.den);
-                 
+                
                 if (av_dup_packet(&packet) < 0)
                 {
                     fprintf(stderr, "Could not duplicate packet\n");
@@ -662,7 +669,9 @@ int main(int argc, char **argv)
             segment_time = prev_segment_time;
         }
 
-        if (closeEnough(segment_time - prev_segment_time, target_segment_duration, 0.5)) {
+        if (closeEnough(segment_time - prev_segment_time, target_segment_duration, 0.5) ||
+            segment_time - prev_segment_time > target_segment_duration) 
+        {
             put_flush_packet(oc->pb);
             url_fclose(oc->pb);
 
@@ -703,6 +712,37 @@ int main(int argc, char **argv)
                 }
             }
             prev_segment_time = segment_time;
+        }
+
+        if (vbsf_h264_mp4toannexb != NULL &&
+            packet.stream_index == video_index)
+        {
+            AVPacket filteredPacket = packet;
+            int a = av_bitstream_filter_filter(vbsf_h264_mp4toannexb,
+                                               video_st->codec,
+                                               NULL,
+                                               &filteredPacket.data,
+                                               &filteredPacket.size,
+                                               packet.data,
+                                               packet.size,
+                                               packet.flags & AV_PKT_FLAG_KEY);
+            if (a > 0)
+            {
+                av_free_packet(&packet);
+                filteredPacket.destruct = av_destruct_packet;
+                packet = filteredPacket;
+            }
+            else if (a < 0)
+            {
+                fprintf(stderr,
+                        "%s failed for stream %d, codec %s",
+                        vbsf_h264_mp4toannexb->filter->name,
+                        packet.stream_index,
+                        video_st->codec->codec ?
+                        video_st->codec->codec->name : "copy");
+                av_free_packet(&packet);
+                continue;
+            }
         }
 
         ret = av_interleaved_write_frame(oc, &packet);
