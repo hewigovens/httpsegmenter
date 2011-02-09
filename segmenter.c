@@ -1,3 +1,7 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*-
+   NOTE: the first line of this file sets up source code indentation rules
+   for Emacs; it is also a hint to anyone modifying this file.
+*/
 /* $Id$
  * $HeadURL
  *
@@ -86,118 +90,244 @@ static AVStream *add_output_stream(AVFormatContext *output_format_context, AVStr
     return output_stream;
 }
 
-FILE * start_index_file(const char tmp_index[])
+typedef struct SMSegmentInfo
 {
-    FILE * tmp_index_fp = fopen(tmp_index, "w+b");
-    if (!tmp_index_fp)
-    {
-        fprintf(stderr, "Could not open temporary m3u8 index file (%s), no index file will be created\n", tmp_index);
-        return NULL;
-    };
+    unsigned int index;
+    double duration;
+    char * filename;
+  
+} TSMSegmentInfo;
 
-    return tmp_index_fp;
+typedef struct SMPlaylist
+{
+    /* a ring buffer of segments */
+    TSMSegmentInfo * buffer;
+
+    /* maximum number of segments that can be stored in the ring buffer */
+    unsigned int bufferCapacity;
+
+    /* index of the first segment on the ring buffer */
+    unsigned int first;
+    
+    /* how many segments are currently in the ring buffer */
+    unsigned int count;
+
+    /* shortcuts */
+    unsigned int targetDuration;
+    char * httpPrefix;
+
+    /* playlist file used for non-live streaming */
+    FILE * file;
+  
+} TSMPlaylist;
+
+static char *
+duplicateString(const char * str)
+{
+    /* unfortunately strdup isn't always available */
+    size_t strSize = strlen(str) + 1;
+    char * copy = (char *) malloc(strSize);
+    memcpy(copy, str, strSize);
+    return copy;
 }
 
-FILE * write_index_file(FILE * tmp_index_fp,
-                        const double segment_duration,
-                        const char output_prefix[],
-                        const char http_prefix[],
-                        const unsigned int segment_index)
+static TSMPlaylist *
+createPlaylist(const unsigned int max_segments,
+               const unsigned int target_segment_duration,
+               const char * http_prefix)
 {
-    char write_buf[1024] = { 0 };
+    TSMPlaylist * playlist = (TSMPlaylist *) malloc(sizeof(TSMPlaylist));
+    memset(playlist, 0, sizeof(TSMPlaylist));
 
-    if (!tmp_index_fp)
+    if (max_segments)
     {
-        return NULL;
-    }
-
-    snprintf(write_buf,
-             sizeof(write_buf),
-             "#EXTINF:%u,\n%s%s-%u.ts\n",
-             (int)(segment_duration + 0.5),
-             http_prefix,
-             output_prefix,
-             segment_index);
-    
-    if (fwrite(write_buf, strlen(write_buf), 1, tmp_index_fp) != 1)
-    {
-        fprintf(stderr, "Could not write to m3u8 index file, will not continue writing to index file\n");
-        fclose(tmp_index_fp);
-        return NULL;
+        playlist->buffer = (TSMSegmentInfo *) malloc(sizeof(TSMSegmentInfo) *
+                                                     max_segments);
     }
     
-    return tmp_index_fp;
+    playlist->bufferCapacity = max_segments;
+    playlist->targetDuration = target_segment_duration;
+    playlist->httpPrefix = duplicateString(http_prefix);
+    
+    return playlist;
 }
 
-FILE * close_index_file(FILE * tmp_index_fp,
-                        const char index[],
-                        const unsigned int target_segment_duration,
-                        const unsigned int first_segment,
-                        const int window)
+static void
+updateLivePlaylist(TSMPlaylist * playlist,
+                   const char * playlistFileName,
+                   const char * outputFileName,
+                   const unsigned int segmentIndex,
+                   const double segmentDuration)
 {
-    char write_buf[1024] = { 0 };
-    FILE * index_fp = NULL;
+    unsigned int bufferIndex = 0;
+    TSMSegmentInfo * nextSegment = NULL;
+    TSMSegmentInfo removeMe;
+    memset(&removeMe, 0, sizeof(removeMe));
+    assert(!playlist->file);
     
-    if (!tmp_index_fp)
+    if (playlist->count == playlist->bufferCapacity)
     {
-        return NULL;
-    }
-    
-    index_fp = fopen(index, "wb");
-    if (!index_fp)
-    {
-        fprintf(stderr, "Could not open m3u8 index file (%s), no index file will be created\n", index);
-	fclose(tmp_index_fp);
-	return NULL;
-    };
-
-    if (window)
-    {
-        snprintf(write_buf,
-                 sizeof(write_buf),
-                 "#EXTM3U\n#EXT-X-TARGETDURATION:%u\n#EXT-X-MEDIA-SEQUENCE:%u\n",
-                 target_segment_duration,
-                 first_segment);
+        /* keep track of the segment that should be removed */
+        removeMe = playlist->buffer[playlist->first];
+        
+        /* make room for the new segment */
+        playlist->first++;
+        playlist->first %= playlist->bufferCapacity;
     }
     else
     {
-        snprintf(write_buf,
-                 sizeof(write_buf),
-                 "#EXTM3U\n#EXT-X-TARGETDURATION:%u\n",
-                 target_segment_duration);
+        playlist->count++;
     }
+
+    /* store the new segment info */
+    bufferIndex = ((playlist->first + playlist->count - 1) %
+                   playlist->bufferCapacity);
+    nextSegment = &playlist->buffer[bufferIndex];
+    nextSegment->filename = duplicateString(outputFileName);
+    nextSegment->duration = segmentDuration;
+    nextSegment->index = segmentIndex;
     
-    if (fwrite(write_buf, strlen(write_buf), 1, index_fp) != 1)
+    /* live streaming -- write full playlist from scratch */
+    playlist->file = fopen(playlistFileName, "w+b");
+    
+    if (playlist->file)
     {
-        fprintf(stderr, "Could not write to m3u8 index file, will not continue writing to index file\n");
-        fclose(index_fp);
-	fclose(tmp_index_fp);
-        return NULL;
-    }
-
-    /* rewind the temp index file and transfer it's contents into the index file */
-    {
-        char ch;
-
-        rewind(tmp_index_fp);
-        while (fread(&ch, 1, 1, tmp_index_fp) == 1)
+        const TSMSegmentInfo * first = &playlist->buffer[playlist->first];
+        
+        char tmp[1024] = { 0 };
+        snprintf(tmp,
+                 sizeof(tmp),
+                 "#EXTM3U\n"
+                 "#EXT-X-TARGETDURATION:%u\n"
+                 "#EXT-X-MEDIA-SEQUENCE:%u\n",
+                 playlist->targetDuration,
+                 first->index);
+        fwrite(tmp, strlen(tmp), 1, playlist->file);
+        
+        for (unsigned int i = 0; i < playlist->count; i++)
         {
-            fwrite(&ch, 1, 1, index_fp);
+            unsigned int j = ((playlist->first + i) %
+                              playlist->bufferCapacity);
+            
+            const TSMSegmentInfo * segment = &playlist->buffer[j];
+            snprintf(tmp,
+                     sizeof(tmp),
+                     "#EXTINF:%u,\n%s%s\n",
+                     (int)(segment->duration + 0.5),
+                     playlist->httpPrefix,
+                     segment->filename);
+            fwrite(tmp, strlen(tmp), 1, playlist->file);
         }
-
-	fclose(tmp_index_fp);
-	tmp_index_fp = NULL;
+        
+        snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
+        fwrite(tmp, strlen(tmp), 1, playlist->file);
+        
+        fclose(playlist->file);
+        playlist->file = NULL;
+    }
+    else
+    {
+        fprintf(stderr,
+                "Could not open m3u8 index file (%s), "
+                "no index file will be created\n",
+                playlistFileName);
     }
     
-    snprintf(write_buf, sizeof(write_buf), "#EXT-X-ENDLIST\n");
-    if (fwrite(write_buf, strlen(write_buf), 1, index_fp) != 1)
+    if (removeMe.filename)
     {
-        fprintf(stderr, "Could not write last file and endlist tag to m3u8 index file\n");
+        /* remove the oldest segment file */
+        remove(removeMe.filename);
+        free(removeMe.filename);
     }
-
-    fclose(index_fp);
-    return tmp_index_fp;
 }
+
+static void
+updatePlaylist(TSMPlaylist * playlist,
+               const char * playlistFileName,
+               const char * segmentFileName,
+               const unsigned int segmentIndex,
+               const double segmentDuration)
+{
+    if (playlist->bufferCapacity > 0)
+    {
+        /* create a live streaming playlist */
+        updateLivePlaylist(playlist,
+                           playlistFileName,
+                           segmentFileName,
+                           segmentIndex,
+                           segmentDuration);
+    }
+    else
+    {
+        /* append to the existing playlist */
+        char tmp[1024] = { 0 };
+
+        if (!playlist->file)
+        {
+            playlist->file = fopen(playlistFileName, "w+b");
+            snprintf(tmp,
+                     sizeof(tmp),
+                     "#EXTM3U\n"
+                     "#EXT-X-TARGETDURATION:%u\n",
+                     playlist->targetDuration);
+            fwrite(tmp, strlen(tmp), 1, playlist->file);
+        }
+        
+        if (!playlist->file)
+        {
+            fprintf(stderr,
+                    "Could not open m3u8 index file (%s), "
+                    "no index file will be created\n",
+                    playlistFileName);
+        }
+        
+        snprintf(tmp,
+                 sizeof(tmp),
+                 "#EXTINF:%u,\n%s%s\n",
+                 (int)(segmentDuration + 0.5),
+                 playlist->httpPrefix,
+                 segmentFileName);
+        fwrite(tmp, strlen(tmp), 1, playlist->file);
+    }
+}
+
+static void
+closePlaylist(TSMPlaylist * playlist)
+{
+    if (playlist->file)
+    {
+        /* append to the existing playlist */
+        char tmp[1024] = { 0 };
+        
+        snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
+        fwrite(tmp, strlen(tmp), 1, playlist->file);
+        
+        fclose(playlist->file);
+        playlist->file = NULL;
+    }
+}
+
+static void
+releasePlaylist(TSMPlaylist ** playlistRef)
+{
+    TSMPlaylist * playlist = *playlistRef;
+    closePlaylist(playlist);
+    
+    for (unsigned int i = 0; i < playlist->bufferCapacity; i++)
+    {
+        TSMSegmentInfo * segmentInfo = &playlist->buffer[i];
+        if (segmentInfo->filename)
+        {
+            free(segmentInfo->filename);
+        }
+    }
+    
+    free(playlist->buffer);
+    free(playlist->httpPrefix);
+    free(playlist);
+    *playlistRef = NULL;
+}
+    
 
 typedef struct SMPacketLink
 {
@@ -370,49 +500,37 @@ removeAllPackets(TSMStreamLace * lace)
     }
 }
 
-static int
-closeEnough(double value, double targetValue, double tolerance)
-{
-    double error = fabs(targetValue - value);
-    return (error <= tolerance) ? 1 : 0;
-}
-
 int main(int argc, char **argv)
 {
-    const char *input;
-    const char *output_prefix;
-    double target_segment_duration;
-    char *segment_duration_check;
-    const char *index;
-    char *tmp_index;
-    const char *http_prefix;
+    const char *input = NULL;
+    const char *output_prefix = "";
+    double target_segment_duration = 0.0;
+    char *segment_duration_check = NULL;
+    const char *playlist_filename = NULL;
+    const char *http_prefix = "";
     long max_tsfiles = 0;
-    char *max_tsfiles_check;
+    char *max_tsfiles_check = NULL;
     double prev_segment_time = 0.0;
     double segment_duration = 0.0;
-    unsigned int output_index = 1;
-    AVOutputFormat *ofmt;
+    unsigned int output_index = 0;
+    AVOutputFormat *ofmt = NULL;
     AVFormatContext *ic = NULL;
-    AVFormatContext *oc;
+    AVFormatContext *oc = NULL;
     AVStream *video_st = NULL;
     AVStream *audio_st = NULL;
-    AVCodec *codec;
-    char *output_filename;
-    char *remove_filename;
-    int video_index;
-    int audio_index;
+    AVCodec *codec = NULL;
+    char *output_filename = NULL;
+    int video_index = -1;
+    int audio_index = -1;
     int kill_file = 0;
-    unsigned int first_segment = 1;
-    unsigned int last_segment = 0;
     int decode_done = 0;
-    char *dot;
-    int ret;
-    int i;
-    int remove_file;
-    FILE * pid_file;
+    int ret = 0;
+    int i = 0;
+    FILE * pid_file = NULL;
     TSMStreamLace * streamLace = NULL;
-    FILE * tmp_index_fp = NULL;
     AVBitStreamFilterContext * vbsf_h264_mp4toannexb = NULL;
+    TSMPlaylist * playlist = NULL;
+    const double segment_duration_error_tolerance = 0.5;
     
     if (argc < 6 || argc > 8) {
         fprintf(stderr,
@@ -456,7 +574,7 @@ int main(int argc, char **argv)
         goto error;
     }
     output_prefix = argv[3];
-    index = argv[4];
+    playlist_filename = argv[4];
     http_prefix=argv[5];
     if (argc >= 7) {
         max_tsfiles = strtol(argv[6], &max_tsfiles_check, 10);
@@ -469,31 +587,20 @@ int main(int argc, char **argv)
     // end programm when it found a file with name 'kill'
     if (argc >= 8) kill_file = atoi(argv[7]);
 
-    remove_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
-    if (!remove_filename) {
-        fprintf(stderr, "Could not allocate space for remove filenames\n");
-        goto error;
-    }
-
     output_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
     if (!output_filename) {
         fprintf(stderr, "Could not allocate space for output filenames\n");
         goto error;
     }
 
-    tmp_index = malloc(strlen(index) + 2);
-    if (!tmp_index) {
-        fprintf(stderr, "Could not allocate space for temporary index filename\n");
+    playlist = createPlaylist(max_tsfiles,
+                              target_segment_duration,
+                              http_prefix);
+    if (!playlist)
+    {
+        fprintf(stderr, "Could not allocate space for m3u8 playlist structure\n");
         goto error;
     }
-
-    strncpy(tmp_index, index, strlen(index) + 2);
-    dot = strrchr(tmp_index, '/');
-    dot = dot ? dot + 1 : tmp_index;
-    for (i = strlen(tmp_index) + 1; i > dot - tmp_index; i--) {
-        tmp_index[i] = tmp_index[i - 1];
-    }
-    *dot = '.';
 
     ret = av_open_input_file(&ic, input, NULL, 0, NULL);
     if (ret != 0) {
@@ -570,7 +677,7 @@ int main(int argc, char **argv)
       }
     }
 
-    snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, output_index++);
+    snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, ++output_index);
     if (url_fopen(&oc->pb, output_filename, URL_WRONLY) < 0) {
         fprintf(stderr, "Could not open '%s'\n", output_filename);
         goto error;
@@ -582,8 +689,6 @@ int main(int argc, char **argv)
     }
 
     prev_segment_time = (double)(ic->start_time) / (double)(AV_TIME_BASE);
-
-    tmp_index_fp = start_index_file(tmp_index);
 
     streamLace = createStreamLace(ic->nb_streams);
     
@@ -669,32 +774,18 @@ int main(int argc, char **argv)
             segment_time = prev_segment_time;
         }
 
-        if (closeEnough(segment_time - prev_segment_time, target_segment_duration, 0.5) ||
-            segment_time - prev_segment_time > target_segment_duration) 
+        if (segment_time - prev_segment_time + segment_duration_error_tolerance > target_segment_duration) 
         {
             put_flush_packet(oc->pb);
             url_fclose(oc->pb);
 
-            if (max_tsfiles && (int)(last_segment - first_segment) >= max_tsfiles - 1) {
-                remove_file = 1;
-                first_segment++;
-            }
-            else {
-                remove_file = 0;
-            }
-
-            tmp_index_fp = write_index_file(tmp_index_fp,
-                                            segment_time - prev_segment_time,
-                                            output_prefix,
-                                            http_prefix,
-                                            ++last_segment);
+            updatePlaylist(playlist,
+                           playlist_filename,
+                           output_filename,
+                           output_index,
+                           segment_time - prev_segment_time);
             
-            if (remove_file) {
-                snprintf(remove_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, first_segment - 1);
-                remove(remove_filename);
-            }
-
-            snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, output_index++);
+            snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, ++output_index);
             if (url_fopen(&oc->pb, output_filename, URL_WRONLY) < 0) {
                 fprintf(stderr, "Could not open '%s'\n", output_filename);
                 break;
@@ -772,23 +863,14 @@ int main(int argc, char **argv)
     url_fclose(oc->pb);
     av_free(oc);
 
-    if (max_tsfiles && (int)(last_segment - first_segment) >= max_tsfiles - 1) {
-        remove_file = 1;
-        first_segment++;
-    }
-    else {
-        remove_file = 0;
-    }
-
-    tmp_index_fp = write_index_file(tmp_index_fp, segment_duration, output_prefix, http_prefix, ++last_segment);    tmp_index_fp = close_index_file(tmp_index_fp, index, target_segment_duration, first_segment, max_tsfiles);
+    updatePlaylist(playlist,
+                   playlist_filename,
+                   output_filename,
+                   output_index,
+                   segment_duration);
+    closePlaylist(playlist);
+    releasePlaylist(&playlist);
     
-    remove(tmp_index);
-    
-    if (remove_file) {
-        snprintf(remove_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, first_segment - 1);
-        remove(remove_filename);
-    }
-
     remove("./segmenter.pid");
 
     return 0;
