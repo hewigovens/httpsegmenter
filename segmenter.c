@@ -219,8 +219,8 @@ updateLivePlaylist(TSMPlaylist * playlist,
             fwrite(tmp, strlen(tmp), 1, playlist->file);
         }
         
-        snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
-        fwrite(tmp, strlen(tmp), 1, playlist->file);
+        //snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
+        //fwrite(tmp, strlen(tmp), 1, playlist->file);
         
         fclose(playlist->file);
         playlist->file = NULL;
@@ -297,10 +297,10 @@ closePlaylist(TSMPlaylist * playlist)
     if (playlist->file)
     {
         /* append to the existing playlist */
-        char tmp[1024] = { 0 };
+        //char tmp[1024] = { 0 };
         
-        snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
-        fwrite(tmp, strlen(tmp), 1, playlist->file);
+        //snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
+        //fwrite(tmp, strlen(tmp), 1, playlist->file);
         
         fclose(playlist->file);
         playlist->file = NULL;
