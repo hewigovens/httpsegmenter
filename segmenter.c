@@ -61,7 +61,7 @@ static AVStream *add_output_stream(AVFormatContext *output_format_context, AVStr
     }
 
     switch (input_codec_context->codec_type) {
-        case CODEC_TYPE_AUDIO:
+        case AVMEDIA_TYPE_AUDIO:
             output_codec_context->channel_layout = input_codec_context->channel_layout;
             output_codec_context->sample_rate = input_codec_context->sample_rate;
             output_codec_context->channels = input_codec_context->channels;
@@ -73,7 +73,7 @@ static AVStream *add_output_stream(AVFormatContext *output_format_context, AVStr
                 output_codec_context->block_align = input_codec_context->block_align;
             }
             break;
-        case CODEC_TYPE_VIDEO:
+        case AVMEDIA_TYPE_VIDEO:
             output_codec_context->pix_fmt = input_codec_context->pix_fmt;
             output_codec_context->width = input_codec_context->width;
             output_codec_context->height = input_codec_context->height;
@@ -643,12 +643,12 @@ int main(int argc, char **argv)
 
     for (i = 0; i < ic->nb_streams && (video_index < 0 || audio_index < 0); i++) {
         switch (ic->streams[i]->codec->codec_type) {
-            case CODEC_TYPE_VIDEO:
+            case AVMEDIA_TYPE_VIDEO:
                 video_index = i;
                 ic->streams[i]->discard = AVDISCARD_NONE;
                 video_st = add_output_stream(oc, ic->streams[i]);
                 break;
-            case CODEC_TYPE_AUDIO:
+            case AVMEDIA_TYPE_AUDIO:
                 audio_index = i;
                 ic->streams[i]->discard = AVDISCARD_NONE;
                 audio_st = add_output_stream(oc, ic->streams[i]);
@@ -764,7 +764,7 @@ int main(int argc, char **argv)
 
         segment_duration = packetStartTime + packetDuration - prev_segment_time;
 
-        if (packet.stream_index == video_index && (packet.flags & PKT_FLAG_KEY)) {
+        if (packet.stream_index == video_index && (packet.flags & AV_PKT_FLAG_KEY)) {
             segment_time = packetStartTime;
         }
         else if (video_index < 0) {
