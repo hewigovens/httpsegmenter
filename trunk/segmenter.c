@@ -246,7 +246,7 @@ updatePlaylist(TSMPlaylist * playlist,
                const char * playlistFileName,
                const char * segmentFileName,
                const unsigned int segmentIndex,
-               const double segmentDuration)
+               const int segmentDuration)
 {
     if (playlist->bufferCapacity > 0)
     {
@@ -284,7 +284,7 @@ updatePlaylist(TSMPlaylist * playlist,
         snprintf(tmp,
                  sizeof(tmp),
                  "#EXTINF:%u,\n%s%s\n",
-                 (int)(segmentDuration + 0.5),
+                 segmentDuration,
                  playlist->httpPrefix,
                  segmentFileName);
         fwrite(tmp, strlen(tmp), 1, playlist->file);
@@ -297,10 +297,10 @@ closePlaylist(TSMPlaylist * playlist)
     if (playlist->file)
     {
         /* append to the existing playlist */
-        //char tmp[1024] = { 0 };
+        char tmp[1024] = { 0 };
         
-        //snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
-        //fwrite(tmp, strlen(tmp), 1, playlist->file);
+        snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
+        fwrite(tmp, strlen(tmp), 1, playlist->file);
         
         fclose(playlist->file);
         playlist->file = NULL;
@@ -530,8 +530,9 @@ int main(int argc, char **argv)
     TSMStreamLace * streamLace = NULL;
     AVBitStreamFilterContext * vbsf_h264_mp4toannexb = NULL;
     TSMPlaylist * playlist = NULL;
-    const double segment_duration_error_tolerance = 0.5;
-    
+    const double segment_duration_error_tolerance = 0.05;
+    double extra_duration_needed = 0;
+
     if (argc < 6 || argc > 8) {
         fprintf(stderr,
                 "Usage: %s <input MPEG-TS file> "
@@ -602,7 +603,7 @@ int main(int argc, char **argv)
         goto error;
     }
 
-    ret = av_open_input_file(&ic, input, NULL, 0, NULL);
+    ret = avformat_open_input(&ic, input, NULL, NULL);
     if (ret != 0) {
         fprintf(stderr, "Could not open input file, make sure it is an mpegts or mp4 file: %d\n", ret);
         goto error;
@@ -613,6 +614,7 @@ int main(int argc, char **argv)
         goto error;
     }
 
+    // NOTE(patrick@ooyala.com): Does not work. Pre-mux with ffmpeg instead.
     if (strstr(ic->iformat->name, "mp4") != NULL)
     {
         // need to filter the bitstream when re-formatting mp4 to mpeg-ts:
@@ -659,12 +661,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (av_set_parameters(oc, NULL) < 0) {
-        fprintf(stderr, "Invalid output format parameters\n");
-        goto error;
-    }
-
-    dump_format(oc, 0, output_prefix, 1);
+    av_dump_format(oc, 0, output_prefix, 1);
     
     if (video_index >=0) {
       codec = avcodec_find_decoder(video_st->codec->codec_id);
@@ -672,18 +669,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "Could not find video decoder, key frames will not be honored\n");
       }
 
-      if (avcodec_open(video_st->codec, codec) < 0) {
+      if (avcodec_open2(video_st->codec, codec, NULL) < 0) {
         fprintf(stderr, "Could not open video decoder, key frames will not be honored\n");
       }
     }
 
     snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, ++output_index);
-    if (url_fopen(&oc->pb, output_filename, URL_WRONLY) < 0) {
+    if (avio_open(&oc->pb, output_filename, URL_WRONLY) < 0) {
         fprintf(stderr, "Could not open '%s'\n", output_filename);
         goto error;
     }
 
-    if (av_write_header(oc)) {
+    if (avformat_write_header(oc, NULL)) {
         fprintf(stderr, "Could not write mpegts header to first output file\n");
         goto error;
     }
@@ -764,7 +761,9 @@ int main(int argc, char **argv)
 
         segment_duration = packetStartTime + packetDuration - prev_segment_time;
 
-        if (packet.stream_index == video_index && (packet.flags & AV_PKT_FLAG_KEY)) {
+        // Allow segmenting between keyframes to produce more accurate chunk lengths, which provides
+        // better seeking behavior.
+        if (packet.stream_index == video_index /*&& (packet.flags & AV_PKT_FLAG_KEY)*/) {
             segment_time = packetStartTime;
         }
         else if (video_index < 0) {
@@ -774,19 +773,24 @@ int main(int argc, char **argv)
             segment_time = prev_segment_time;
         }
 
-        if (segment_time - prev_segment_time + segment_duration_error_tolerance > target_segment_duration) 
+        if (segment_time - prev_segment_time + segment_duration_error_tolerance > target_segment_duration + extra_duration_needed) 
         {
-            put_flush_packet(oc->pb);
-            url_fclose(oc->pb);
+            avio_flush(oc->pb);
+            avio_close(oc->pb);
+
+            // Keep track of accumulated rounding error to account for it in later chunks.
+            double segment_duration = segment_time - prev_segment_time;
+            int rounded_segment_duration = (int)(segment_duration + 0.5);
+            extra_duration_needed += (double)rounded_segment_duration - segment_duration;
 
             updatePlaylist(playlist,
                            playlist_filename,
                            output_filename,
                            output_index,
-                           segment_time - prev_segment_time);
+                           rounded_segment_duration);
             
             snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, ++output_index);
-            if (url_fopen(&oc->pb, output_filename, URL_WRONLY) < 0) {
+            if (avio_open(&oc->pb, output_filename, URL_WRONLY) < 0) {
                 fprintf(stderr, "Could not open '%s'\n", output_filename);
                 break;
             }
@@ -860,7 +864,7 @@ int main(int argc, char **argv)
         av_freep(&oc->streams[i]);
     }
 
-    url_fclose(oc->pb);
+    avio_close(oc->pb);
     av_free(oc);
 
     updatePlaylist(playlist,
