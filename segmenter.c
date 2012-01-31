@@ -20,6 +20,9 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,6 +33,54 @@
 #include <math.h>
 
 #include "libavformat/avformat.h"
+
+#ifdef _WIN32
+//----------------------------------------------------------------
+// utf8_to_utf16
+// 
+static wchar_t *
+utf8_to_utf16(const char * str_utf8)
+{
+    int nchars = MultiByteToWideChar(CP_UTF8, 0, str_utf8, -1, NULL, 0);
+	wchar_t * str_utf16 = (wchar_t *)malloc(nchars * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, str_utf8, -1, str_utf16, nchars);
+    return str_utf16;
+}
+
+//----------------------------------------------------------------
+// utf16_to_utf8
+// 
+static char *
+utf16_to_utf8(const wchar_t * str_utf16)
+{
+    int nchars = WideCharToMultiByte(CP_UTF8, 0, str_utf16, -1, NULL, 0, 0, 0);
+    char * str_utf8 = (char *)malloc(nchars * sizeof(char));
+    WideCharToMultiByte(CP_UTF8, 0, str_utf16, -1, str_utf8, nchars, 0, 0);
+    return str_utf8;
+}
+#endif
+
+//----------------------------------------------------------------
+// fopen_utf8
+// 
+static FILE *
+fopen_utf8(const char * filename, const char * mode)
+{
+	FILE * file = NULL;
+	
+#ifdef _WIN32
+    wchar_t * wname = utf8_to_utf16(filename);
+    wchar_t * wmode = utf8_to_utf16(mode);
+    file = _wfopen(wname, wmode);
+    free(wname);
+    free(wmode);
+#else
+	file = fopen(filename, mode);
+#endif
+	
+	return file;
+}
+
 
 static AVStream *add_output_stream(AVFormatContext *output_format_context, AVStream *input_stream) {
     AVCodecContext *input_codec_context;
@@ -188,7 +239,7 @@ updateLivePlaylist(TSMPlaylist * playlist,
     nextSegment->index = segmentIndex;
     
     /* live streaming -- write full playlist from scratch */
-    playlist->file = fopen(playlistFileName, "w+b");
+    playlist->file = fopen_utf8(playlistFileName, "w+b");
     
     if (playlist->file)
     {
@@ -264,7 +315,7 @@ updatePlaylist(TSMPlaylist * playlist,
 
         if (!playlist->file)
         {
-            playlist->file = fopen(playlistFileName, "w+b");
+            playlist->file = fopen_utf8(playlistFileName, "w+b");
             snprintf(tmp,
                      sizeof(tmp),
                      "#EXTM3U\n"
@@ -500,7 +551,7 @@ removeAllPackets(TSMStreamLace * lace)
     }
 }
 
-int main(int argc, char **argv)
+int main_utf8(int argc, char **argv)
 {
     const char *input = NULL;
     const char *output_prefix = "";
@@ -556,7 +607,7 @@ int main(int argc, char **argv)
     }
 
     // Create PID file
-    pid_file=fopen("./segmenter.pid", "wb");
+    pid_file = fopen_utf8("./segmenter.pid", "wb");
     if (pid_file)
     {
         fprintf(pid_file, "%d", getpid());
@@ -885,5 +936,43 @@ error:
     return 1;
 
 }
+
+#ifdef _WIN32
+
+//----------------------------------------------------------------
+// __wgetmainargs
+// 
+extern void __wgetmainargs(int * argc,
+                           wchar_t *** argv,
+                           wchar_t *** env,
+                           int doWildCard,
+                           int * startInfo);
+
+//----------------------------------------------------------------
+// main
+// 
+int main()
+{
+	wchar_t ** wenpv = NULL;
+    wchar_t ** wargv = NULL;
+	int argc = 0;
+    int startupInfo = 0;
+
+	__wgetmainargs(&argc, &wargv, &wenpv, 1, &startupInfo);
+    
+    char ** argv = (char **)malloc(argc * sizeof(char *));
+    for (int i = 0; i < argc; i++)
+    {
+        argv[i] = utf16_to_utf8(wargv[i]);
+    }
+    
+    return main_utf8(argc, argv);
+}
+#else
+int main(int argc, char ** argv)
+{
+    return main_utf8(argc, argv);
+}
+#endif
 
 // vim:sw=4:tw=4:ts=4:ai:expandtab
