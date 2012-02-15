@@ -42,7 +42,7 @@ static wchar_t *
 utf8_to_utf16(const char * str_utf8)
 {
     int nchars = MultiByteToWideChar(CP_UTF8, 0, str_utf8, -1, NULL, 0);
-	wchar_t * str_utf16 = (wchar_t *)malloc(nchars * sizeof(wchar_t));
+    wchar_t * str_utf16 = (wchar_t *)malloc(nchars * sizeof(wchar_t));
     MultiByteToWideChar(CP_UTF8, 0, str_utf8, -1, str_utf16, nchars);
     return str_utf16;
 }
@@ -66,8 +66,8 @@ utf16_to_utf8(const wchar_t * str_utf16)
 static FILE *
 fopen_utf8(const char * filename, const char * mode)
 {
-	FILE * file = NULL;
-	
+    FILE * file = NULL;
+    
 #ifdef _WIN32
     wchar_t * wname = utf8_to_utf16(filename);
     wchar_t * wmode = utf8_to_utf16(mode);
@@ -75,10 +75,10 @@ fopen_utf8(const char * filename, const char * mode)
     free(wname);
     free(wmode);
 #else
-	file = fopen(filename, mode);
+    file = fopen(filename, mode);
 #endif
-	
-	return file;
+    
+    return file;
 }
 
 
@@ -87,11 +87,12 @@ static AVStream *add_output_stream(AVFormatContext *output_format_context, AVStr
     AVCodecContext *output_codec_context;
     AVStream *output_stream;
 
-    output_stream = av_new_stream(output_format_context, 0);
+    output_stream = avformat_new_stream(output_format_context, NULL);
     if (!output_stream) {
         fprintf(stderr, "Could not allocate stream\n");
         exit(1);
     }
+    output_stream->id = 0;
 
     input_codec_context = input_stream->codec;
     output_codec_context = output_stream->codec;
@@ -270,8 +271,8 @@ updateLivePlaylist(TSMPlaylist * playlist,
             fwrite(tmp, strlen(tmp), 1, playlist->file);
         }
         
-        //snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
-        //fwrite(tmp, strlen(tmp), 1, playlist->file);
+        // snprintf(tmp, sizeof(tmp), "#EXT-X-ENDLIST\n");
+        // fwrite(tmp, strlen(tmp), 1, playlist->file);
         
         fclose(playlist->file);
         playlist->file = NULL;
@@ -551,6 +552,52 @@ removeAllPackets(TSMStreamLace * lace)
     }
 }
 
+//----------------------------------------------------------------
+// usage3
+// 
+static void usage3(char ** argv, const char * message, const char * details)
+{
+    if (message)
+    {
+        fprintf(stderr, "ERROR: %s%s\n\n", message, details);
+    }
+    
+    fprintf(stderr,
+            "USAGE: %s "
+            "-i input-MPEG-TS-file "
+            "-d seconds-per-segment "
+            "[-o segment-file-prefix] "
+            "-x output-playlist-m3u8 "
+            "[-p http-prefix] "
+            "[-w max-live-segments] "
+            "[--watch-for-kill-file] "
+            "[--strict-segment-duration] "
+            "\n\n",
+            argv[0]);
+    
+    fprintf(stderr,
+            "Compiled by Daniel Espendiller - www.espend.de\n"
+            "build on %s %s with %s\n\n"
+            "Took some code from:\n"
+            " - source:http://svn.assembla.com/svn/legend/segmenter/\n"
+            " - iStreamdev:http://projects.vdr-developer.org/git/?p=istreamdev.git;a=tree;f=segmenter;hb=HEAD\n"
+            " - live_segmenter:http://github.com/carsonmcdonald/HTTP-Live-Video-Stream-Segmenter-and-Distributor\n",
+            __DATE__,
+            __TIME__,
+            __VERSION__);
+    
+    exit(1);
+}
+
+//----------------------------------------------------------------
+// usage
+// 
+static void usage(char ** argv, const char * message)
+{ usage3(argv, message, ""); }
+
+//----------------------------------------------------------------
+// main_utf8
+// 
 int main_utf8(int argc, char **argv)
 {
     const char *input = NULL;
@@ -579,33 +626,90 @@ int main_utf8(int argc, char **argv)
     int i = 0;
     FILE * pid_file = NULL;
     TSMStreamLace * streamLace = NULL;
-    AVBitStreamFilterContext * vbsf_h264_mp4toannexb = NULL;
     TSMPlaylist * playlist = NULL;
     const double segment_duration_error_tolerance = 0.05;
     double extra_duration_needed = 0;
+    int strict_segment_duration = 0;
+    
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-i") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -i parameter");
+            i++;
+            input = argv[i];
+        }
+        else if (strcmp(argv[i], "-o") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -i parameter");
+            i++;
+            output_prefix = argv[i];
+        }
+        else if (strcmp(argv[i], "-d") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -d parameter");
+            i++;
+            
+            target_segment_duration = strtod(argv[i], &segment_duration_check);
+            if (segment_duration_check == argv[i] ||
+                target_segment_duration == HUGE_VAL ||
+                target_segment_duration == -HUGE_VAL)
+            {
+                usage3(argv, "invalid segment duration: ", argv[i]);
+            }
+        }
+        else if (strcmp(argv[i], "-x") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -x parameter");
+            i++;
+            playlist_filename = argv[i];
+        }
+        else if (strcmp(argv[i], "-p") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -p parameter");
+            i++;
+            http_prefix = argv[i];
+        }
+        else if (strcmp(argv[i], "-w") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -w parameter");
+            i++;
 
-    if (argc < 6 || argc > 8) {
-        fprintf(stderr,
-                "Usage: %s <input MPEG-TS file> "
-                "<segment duration in seconds> "
-                "<output MPEG-TS file prefix> "
-                "<output m3u8 index file> "
-                "<http prefix> "
-                "[<segment window size>] "
-                "[<search kill file>]\n\n"
-                "Compiled by Daniel Espendiller - www.espend.de\n"
-                "build on %s %s with %s\n\n"
-                "Took some code from:\n"
-                " - source:http://svn.assembla.com/svn/legend/segmenter/\n"
-                " - iStreamdev:http://projects.vdr-developer.org/git/?p=istreamdev.git;a=tree;f=segmenter;hb=HEAD\n"
-                " - live_segmenter:http://github.com/carsonmcdonald/HTTP-Live-Video-Stream-Segmenter-and-Distributor\n",
-                argv[0],
-                __DATE__,
-                __TIME__,
-                __VERSION__);
-        exit(1);
+            max_tsfiles = strtol(argv[i], &max_tsfiles_check, 10);
+            if (max_tsfiles_check == argv[i] ||
+                max_tsfiles < 0 ||
+                max_tsfiles >= INT_MAX)
+            {
+                usage3(argv, "invalid live stream max window size: ", argv[i]);
+            }
+        }
+        else if (strcmp(argv[i], "--watch-for-kill-file") == 0)
+        {
+            // end program when it finds a file with name 'kill':
+            kill_file = 1;
+        }
+        else if (strcmp(argv[i], "--strict-segment-duration") == 0)
+        {
+            // force segment creation on non-keyframe boundaries:
+            strict_segment_duration = 1;
+        }
     }
-
+    
+    if (!input)
+    {
+        usage(argv, "-i input file parameter must be specified");
+    }
+    
+    if (!playlist_filename)
+    {
+        usage(argv, "-x m3u8 playlist file parameter must be specified");
+    }
+    
+    if (target_segment_duration == 0.0)
+    {
+        usage(argv, "-d segment duration parameter must be specified");
+    }
+    
     // Create PID file
     pid_file = fopen_utf8("./segmenter.pid", "wb");
     if (pid_file)
@@ -616,29 +720,10 @@ int main_utf8(int argc, char **argv)
 
     av_register_all();
 
-    input = argv[1];
     if (!strcmp(input, "-")) {
         input = "pipe:";
     }
-    target_segment_duration = strtod(argv[2], &segment_duration_check);
-    if (segment_duration_check == argv[2] || target_segment_duration == HUGE_VAL || target_segment_duration == -HUGE_VAL) {
-        fprintf(stderr, "Segment duration time (%s) invalid\n", argv[2]);
-        goto error;
-    }
-    output_prefix = argv[3];
-    playlist_filename = argv[4];
-    http_prefix=argv[5];
-    if (argc >= 7) {
-        max_tsfiles = strtol(argv[6], &max_tsfiles_check, 10);
-        if (max_tsfiles_check == argv[6] || max_tsfiles < 0 || max_tsfiles >= INT_MAX) {
-            fprintf(stderr, "Maximum number of ts files (%s) invalid\n", argv[6]);
-            goto error;
-        }
-    }
-
-    // end programm when it found a file with name 'kill'
-    if (argc >= 8) kill_file = atoi(argv[7]);
-
+    
     output_filename = malloc(sizeof(char) * (strlen(output_prefix) + 15));
     if (!output_filename) {
         fprintf(stderr, "Could not allocate space for output filenames\n");
@@ -660,16 +745,9 @@ int main_utf8(int argc, char **argv)
         goto error;
     }
 
-    if (av_find_stream_info(ic) < 0) {
+    if (avformat_find_stream_info(ic, NULL) < 0) {
         fprintf(stderr, "Could not read stream information\n");
         goto error;
-    }
-
-    // NOTE(patrick@ooyala.com): Does not work. Pre-mux with ffmpeg instead.
-    if (strstr(ic->iformat->name, "mp4") != NULL)
-    {
-        // need to filter the bitstream when re-formatting mp4 to mpeg-ts:
-        vbsf_h264_mp4toannexb = av_bitstream_filter_init("h264_mp4toannexb");
     }
 
 #if LIBAVFORMAT_VERSION_MAJOR > 52 || (LIBAVFORMAT_VERSION_MAJOR == 52 && \
@@ -726,7 +804,7 @@ int main_utf8(int argc, char **argv)
     }
 
     snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, ++output_index);
-    if (avio_open(&oc->pb, output_filename, URL_WRONLY) < 0) {
+    if (avio_open(&oc->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
         fprintf(stderr, "Could not open '%s'\n", output_filename);
         goto error;
     }
@@ -812,9 +890,11 @@ int main_utf8(int argc, char **argv)
 
         segment_duration = packetStartTime + packetDuration - prev_segment_time;
 
-        // Allow segmenting between keyframes to produce more accurate chunk lengths, which provides
-        // better seeking behavior.
-        if (packet.stream_index == video_index /*&& (packet.flags & AV_PKT_FLAG_KEY)*/) {
+        // NOTE: segments are supposed to start on a keyframe.
+        // If the keyframe interval and segment duration do not match
+        // forcing the segment creation for "better seeking behavior"
+        // will result in decoding artifacts after seeking or stream switching.
+        if (packet.stream_index == video_index && (packet.flags & AV_PKT_FLAG_KEY || strict_segment_duration)) {
             segment_time = packetStartTime;
         }
         else if (video_index < 0) {
@@ -824,7 +904,8 @@ int main_utf8(int argc, char **argv)
             segment_time = prev_segment_time;
         }
 
-        if (segment_time - prev_segment_time + segment_duration_error_tolerance > target_segment_duration + extra_duration_needed) 
+        if (segment_time - prev_segment_time + segment_duration_error_tolerance >
+            target_segment_duration + extra_duration_needed) 
         {
             avio_flush(oc->pb);
             avio_close(oc->pb);
@@ -841,7 +922,7 @@ int main_utf8(int argc, char **argv)
                            rounded_segment_duration);
             
             snprintf(output_filename, strlen(output_prefix) + 15, "%s-%u.ts", output_prefix, ++output_index);
-            if (avio_open(&oc->pb, output_filename, URL_WRONLY) < 0) {
+            if (avio_open(&oc->pb, output_filename, AVIO_FLAG_WRITE) < 0) {
                 fprintf(stderr, "Could not open '%s'\n", output_filename);
                 break;
             }
@@ -858,37 +939,6 @@ int main_utf8(int argc, char **argv)
                 }
             }
             prev_segment_time = segment_time;
-        }
-
-        if (vbsf_h264_mp4toannexb != NULL &&
-            packet.stream_index == video_index)
-        {
-            AVPacket filteredPacket = packet;
-            int a = av_bitstream_filter_filter(vbsf_h264_mp4toannexb,
-                                               video_st->codec,
-                                               NULL,
-                                               &filteredPacket.data,
-                                               &filteredPacket.size,
-                                               packet.data,
-                                               packet.size,
-                                               packet.flags & AV_PKT_FLAG_KEY);
-            if (a > 0)
-            {
-                av_free_packet(&packet);
-                filteredPacket.destruct = av_destruct_packet;
-                packet = filteredPacket;
-            }
-            else if (a < 0)
-            {
-                fprintf(stderr,
-                        "%s failed for stream %d, codec %s",
-                        vbsf_h264_mp4toannexb->filter->name,
-                        packet.stream_index,
-                        video_st->codec->codec ?
-                        video_st->codec->codec->name : "copy");
-                av_free_packet(&packet);
-                continue;
-            }
         }
 
         ret = av_interleaved_write_frame(oc, &packet);
@@ -953,12 +1003,12 @@ extern void __wgetmainargs(int * argc,
 // 
 int main()
 {
-	wchar_t ** wenpv = NULL;
+    wchar_t ** wenpv = NULL;
     wchar_t ** wargv = NULL;
-	int argc = 0;
+    int argc = 0;
     int startupInfo = 0;
 
-	__wgetmainargs(&argc, &wargv, &wenpv, 1, &startupInfo);
+    __wgetmainargs(&argc, &wargv, &wenpv, 1, &startupInfo);
     
     char ** argv = (char **)malloc(argc * sizeof(char *));
     for (int i = 0; i < argc; i++)
