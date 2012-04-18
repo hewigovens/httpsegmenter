@@ -33,6 +33,7 @@
 #include <math.h>
 
 #include "libavformat/avformat.h"
+#include "libavutil/opt.h"
 
 #ifdef _WIN32
 //----------------------------------------------------------------
@@ -552,6 +553,31 @@ removeAllPackets(TSMStreamLace * lace)
     }
 }
 
+static int
+loglevel(const char* arg)
+{
+    const struct { const char *name; int level; } log_levels[] = {
+        { "quiet"  , AV_LOG_QUIET   },
+        { "panic"  , AV_LOG_PANIC   },
+        { "fatal"  , AV_LOG_FATAL   },
+        { "error"  , AV_LOG_ERROR   },
+        { "warning", AV_LOG_WARNING },
+        { "info"   , AV_LOG_INFO    },
+        { "verbose", AV_LOG_VERBOSE },
+        { "debug"  , AV_LOG_DEBUG   },
+    };
+    int i;
+    
+    for (i = 0; i < FF_ARRAY_ELEMS(log_levels); i++) {
+        if (!strcmp(log_levels[i].name, arg)) {
+            av_log_set_level(log_levels[i].level);
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
 //----------------------------------------------------------------
 // usage3
 // 
@@ -570,8 +596,11 @@ static void usage3(char ** argv, const char * message, const char * details)
             "-x output-playlist-m3u8 "
             "[-p http-prefix] "
             "[-w max-live-segments] "
+            "[-P pid-file] "
             "[--watch-for-kill-file] "
             "[--strict-segment-duration] "
+            "[--avformat-option opt value] "
+            "[--loglevel level] "
             "\n\n",
             argv[0]);
     
@@ -611,6 +640,8 @@ int main_utf8(int argc, char **argv)
     double prev_segment_time = 0.0;
     double segment_duration = 0.0;
     unsigned int output_index = 0;
+    const AVClass *fc = avformat_get_class();
+    AVDictionary *format_opts = NULL;
     AVOutputFormat *ofmt = NULL;
     AVFormatContext *ic = NULL;
     AVFormatContext *oc = NULL;
@@ -618,18 +649,20 @@ int main_utf8(int argc, char **argv)
     AVStream *audio_st = NULL;
     AVCodec *codec = NULL;
     char *output_filename = NULL;
+    char *pid_filename = NULL;
     int video_index = -1;
     int audio_index = -1;
     int kill_file = 0;
     int decode_done = 0;
     int ret = 0;
     int i = 0;
-    FILE * pid_file = NULL;
     TSMStreamLace * streamLace = NULL;
     TSMPlaylist * playlist = NULL;
     const double segment_duration_error_tolerance = 0.05;
     double extra_duration_needed = 0;
     int strict_segment_duration = 0;
+    
+    av_log_set_level(AV_LOG_INFO);
     
     for (int i = 1; i < argc; i++)
     {
@@ -683,6 +716,12 @@ int main_utf8(int argc, char **argv)
                 usage3(argv, "invalid live stream max window size: ", argv[i]);
             }
         }
+        else if (strcmp(argv[i], "-P") == 0)
+        {
+            if ((argc - i) <= 1) usage(argv, "could not parse -P parameter");
+            i++;
+            pid_filename = argv[i];
+        }
         else if (strcmp(argv[i], "--watch-for-kill-file") == 0)
         {
             // end program when it finds a file with name 'kill':
@@ -692,6 +731,34 @@ int main_utf8(int argc, char **argv)
         {
             // force segment creation on non-keyframe boundaries:
             strict_segment_duration = 1;
+        }
+        else if (strcmp(argv[i], "--avformat-option") == 0)
+        {
+            const AVOption *of;
+            const char *opt;
+            const char *arg;
+            if ((argc - i) <= 1) usage(argv, "could not parse --avformat-option parameter");
+            i++;
+            opt = argv[i];
+            if ((argc - i) <= 1) usage(argv, "could not parse --avformat-option parameter");
+            i++;
+            arg = argv[i];
+
+            if ((of = av_opt_find(&fc, opt, NULL, 0,
+                                  AV_OPT_SEARCH_CHILDREN | AV_OPT_SEARCH_FAKE_OBJ)))
+                av_dict_set(&format_opts, opt, arg, (of->type == AV_OPT_TYPE_FLAGS) ? AV_DICT_APPEND : 0);
+            else
+                usage3(argv, "unknown --avformat-option parameter: ", opt);
+        }
+        else if (strcmp(argv[i], "--loglevel") == 0)
+        {
+            const char *arg;
+            if ((argc - i) <= 1) usage(argv, "could not parse --loglevel parameter");
+            i++;
+            arg = argv[i];
+
+            if (loglevel(arg))
+                usage3(argv, "unknown --loglevel parameter: ", arg);
         }
     }
     
@@ -711,14 +778,18 @@ int main_utf8(int argc, char **argv)
     }
     
     // Create PID file
-    pid_file = fopen_utf8("./segmenter.pid", "wb");
-    if (pid_file)
+    if (pid_filename)
     {
-        fprintf(pid_file, "%d", getpid());
-        fclose(pid_file);
+        FILE* pid_file = fopen_utf8(pid_filename, "wb");
+        if (pid_file)
+        {
+            fprintf(pid_file, "%d", getpid());
+            fclose(pid_file);
+        }
     }
 
     av_register_all();
+    avformat_network_init();
 
     if (!strcmp(input, "-")) {
         input = "pipe:";
@@ -739,11 +810,12 @@ int main_utf8(int argc, char **argv)
         goto error;
     }
 
-    ret = avformat_open_input(&ic, input, NULL, NULL);
+    ret = avformat_open_input(&ic, input, NULL, (format_opts) ? &format_opts : NULL);
     if (ret != 0) {
         fprintf(stderr, "Could not open input file, make sure it is an mpegts or mp4 file: %d\n", ret);
         goto error;
     }
+    av_dict_free(&format_opts);
 
     if (avformat_find_stream_info(ic, NULL) < 0) {
         fprintf(stderr, "Could not read stream information\n");
@@ -881,11 +953,12 @@ int main_utf8(int argc, char **argv)
             (double)(ic->streams[packet.stream_index]->time_base.den);
         
 #if !defined(NDEBUG) && (defined(DEBUG) || defined(_DEBUG))
-        fprintf(stderr,
-                "stream %i, packet [%f, %f)\n",
-                packet.stream_index,
-                packetStartTime,
-                packetStartTime + packetDuration);
+        if (av_log_get_level() >= AV_LOG_VERBOSE)
+            fprintf(stderr,
+                    "stream %i, packet [%f, %f)\n",
+                    packet.stream_index,
+                    packetStartTime,
+                    packetStartTime + packetDuration);
 #endif
 
         segment_duration = packetStartTime + packetDuration - prev_segment_time;
@@ -976,12 +1049,18 @@ int main_utf8(int argc, char **argv)
     closePlaylist(playlist);
     releasePlaylist(&playlist);
     
-    remove("./segmenter.pid");
+    if (pid_filename)
+    {
+        remove(pid_filename);
+    }
 
     return 0;
 
 error:
-    remove("./segmenter.pid");
+    if (pid_filename)
+    {
+        remove(pid_filename);
+    }
 
     return 1;
 
