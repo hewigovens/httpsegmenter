@@ -341,6 +341,7 @@ updatePlaylist(TSMPlaylist * playlist,
                  playlist->httpPrefix,
                  segmentFileName);
         fwrite(tmp, strlen(tmp), 1, playlist->file);
+        fflush(playlist->file);
     }
 }
 
